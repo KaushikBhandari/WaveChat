@@ -14,7 +14,8 @@ import java.util.UUID
 data class MeshMessage(
     val id: String = UUID.randomUUID().toString(),
     val senderId: String,
-    val recipientId: String = BROADCAST_ID, // target device ID; BROADCAST_ID = show to all
+    val senderName: String = "",              // human-readable name set by the user
+    val recipientId: String = BROADCAST_ID,  // target device ID; BROADCAST_ID = show to all
     val text: String,
     val hopCount: Int = 0,
     val timestamp: Long = System.currentTimeMillis()
@@ -30,6 +31,7 @@ data class MeshMessage(
             MeshMessage(
                 id          = json.getString("id"),
                 senderId    = json.getString("sender"),
+                senderName  = json.optString("name", ""),
                 recipientId = json.optString("recipient", BROADCAST_ID),
                 text        = json.getString("text"),
                 hopCount    = json.getInt("hop"),
@@ -42,6 +44,7 @@ data class MeshMessage(
     fun toBytes(): ByteArray = JSONObject().apply {
         put("id",        id)
         put("sender",    senderId)
+        put("name",      senderName)
         put("recipient", recipientId)
         put("text",      text)
         put("hop",       hopCount)

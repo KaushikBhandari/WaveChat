@@ -45,9 +45,10 @@ class MainActivity : ComponentActivity() {
     private val TAG = "WaveChat"
 
     // ── App screens ────────────────────────────────────────────────
+    // SETUP  = first-launch name entry screen
     // SCAN   = showing nearby devices, user selects who to chat with
     // CHAT   = chatting with selected device(s)
-    enum class Screen { SCAN, CHAT }
+    enum class Screen { SETUP, SCAN, CHAT }
     private var screen by mutableStateOf(Screen.SCAN)
 
     // ── State ──────────────────────────────────────────────────────
@@ -71,6 +72,8 @@ class MainActivity : ComponentActivity() {
     )
 
     private var myAddress     by mutableStateOf("local")
+    private var myName        by mutableStateOf("")        // user-chosen display name
+    private var nameInput     by mutableStateOf("")        // text field for name entry
     private var status        by mutableStateOf("Starting…")
     private var statusOk      by mutableStateOf(false)
     private var messageText   by mutableStateOf("")
@@ -148,6 +151,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         meshRouter = MeshRouter("local") { msg, addr -> sendViaBle(msg, addr) }
+        // Load persisted name — show SETUP screen if none saved yet
+        val prefs = getSharedPreferences("wavechat", Context.MODE_PRIVATE)
+        val saved = prefs.getString("myName", "") ?: ""
+        if (saved.isNotBlank()) {
+            myName = saved
+            screen = Screen.SCAN
+        } else {
+            screen = Screen.SETUP
+        }
         registerReceiver(btReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
         setContent { MaterialTheme { AppUI() } }
         checkAndRequestPermissions()
@@ -196,6 +208,10 @@ class MainActivity : ComponentActivity() {
             if (has(Manifest.permission.BLUETOOTH_CONNECT)) adapter.address ?: "local" else "local"
         } catch (_: SecurityException) { "local" }
         meshRouter = MeshRouter(myAddress) { msg, addr -> sendViaBle(msg, addr) }
+        // Apply saved display name to the BLE adapter so peers see it
+        if (myName.isNotBlank()) {
+            try { adapter.name = myName } catch (_: Exception) {}
+        }
         if (!adapter.isEnabled) {
             setStatus("Bluetooth is OFF", false)
             try {
@@ -216,6 +232,16 @@ class MainActivity : ComponentActivity() {
         startBleScan()
     }
 
+    /** Persist the chosen name and apply it as the BLE device name. */
+    @SuppressLint("MissingPermission")
+    private fun saveName(name: String) {
+        myName = name
+        getSharedPreferences("wavechat", Context.MODE_PRIVATE)
+            .edit().putString("myName", name).apply()
+        // Set BLE adapter name so scanners see it immediately
+        try { bluetoothAdapter?.name = name } catch (_: Exception) {}
+    }
+
     // ── Advertising ────────────────────────────────────────────────
     @SuppressLint("MissingPermission")
     private fun startAdvertising() {
@@ -228,6 +254,8 @@ class MainActivity : ComponentActivity() {
                 AdvertiseData.Builder()
                     .addServiceUuid(ParcelUuid(SERVICE_UUID))
                     .setIncludeDeviceName(false).build(),
+                AdvertiseData.Builder()          // scan response carries the name
+                    .setIncludeDeviceName(true).build(),
                 object : AdvertiseCallback() {
                     override fun onStartSuccess(s: AdvertiseSettings) { dbg("Advertising OK") }
                     override fun onStartFailure(c: Int) { dbg("Advertising FAILED $c") }
@@ -266,7 +294,7 @@ class MainActivity : ComponentActivity() {
                     if (!isWaveChat) return
 
                     val device = BleDevice(
-                        name     = friendlyName(addr),
+                        name     = result.device.name?.takeIf { it.isNotBlank() } ?: friendlyName(addr),
                         address  = addr,
                         rssi     = result.rssi,
                         lastSeen = System.currentTimeMillis()
@@ -341,7 +369,8 @@ class MainActivity : ComponentActivity() {
                         meshRouter.onMessageReceived(value, device.address,
                             connectedPeerAddresses.toList()) { msg ->
                             runOnUiThread {
-                                val label = friendlyName(device.address)
+                                val label = msg.senderName.takeIf { it.isNotBlank() }
+                                    ?: friendlyName(device.address)
                                 val chatMsg = ChatMessage(
                                     text        = msg.text,
                                     isMe        = false,
@@ -555,7 +584,7 @@ class MainActivity : ComponentActivity() {
         val text = messageText.trim()
         // Send only to selected+connected peers
         val targets = connectedPeerAddresses.filter { selectedAddresses.contains(it) }
-        val msg = meshRouter.originateMessage(text, targets)
+        val msg = meshRouter.originateMessage(text, targets, senderName = myName)
         val chatMsg = ChatMessage(text, true, "Me")
         targets.forEach { addr ->
             chatHistories.getOrPut(addr) { mutableListOf() }.add(chatMsg)
@@ -613,8 +642,104 @@ class MainActivity : ComponentActivity() {
 
         Box(Modifier.fillMaxSize().background(darkBg)) {
             when (screen) {
-                Screen.SCAN -> ScanScreen(pulseA)
-                Screen.CHAT -> ChatScreen(pulseA)
+                Screen.SETUP -> SetupScreen()
+                Screen.SCAN  -> ScanScreen(pulseA)
+                Screen.CHAT  -> ChatScreen(pulseA)
+            }
+        }
+    }
+
+    // ── SETUP SCREEN (first launch / name entry) ───────────────────
+    @Composable
+    private fun SetupScreen() {
+        val isEdit = myName.isNotBlank()   // true when accessed from settings icon
+        Column(
+            Modifier.fillMaxSize().padding(32.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            // Logo
+            Box(
+                Modifier.size(72.dp)
+                    .background(Brush.linearGradient(listOf(accent, accentSec)), CircleShape),
+                contentAlignment = Alignment.Center
+            ) { Text("📡", fontSize = 34.sp) }
+
+            Spacer(Modifier.height(24.dp))
+            Text("WaveChat", fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, color = textPri)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                if (isEdit) "Change your display name" else "What should others call you?",
+                fontSize = 14.sp, color = textSec
+            )
+            Spacer(Modifier.height(40.dp))
+
+            // Name input
+            Box(
+                Modifier.fillMaxWidth()
+                    .background(cardBg, RoundedCornerShape(16.dp))
+                    .border(1.5.dp, accent.copy(0.4f), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 18.dp, vertical = 4.dp)
+            ) {
+                BasicTextField(
+                    value = nameInput,
+                    onValueChange = { if (it.length <= 24) nameInput = it },
+                    textStyle = TextStyle(color = textPri, fontSize = 18.sp,
+                        fontWeight = FontWeight.SemiBold),
+                    singleLine = true,
+                    decorationBox = { inner ->
+                        Box(Modifier.padding(vertical = 14.dp)) {
+                            if (nameInput.isEmpty())
+                                Text("e.g. Rahul, Alice…", color = textSec, fontSize = 18.sp)
+                            inner()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Text("${nameInput.length}/24", fontSize = 11.sp, color = textSec,
+                modifier = Modifier.align(Alignment.End))
+
+            Spacer(Modifier.height(28.dp))
+
+            // Confirm button
+            Button(
+                onClick = {
+                    val trimmed = nameInput.trim()
+                    if (trimmed.isNotBlank()) {
+                        saveName(trimmed)
+                        nameInput = ""
+                        screen = Screen.SCAN
+                    }
+                },
+                enabled = nameInput.trim().isNotBlank(),
+                modifier = Modifier.fillMaxWidth().height(54.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
+                contentPadding = PaddingValues(0.dp)
+            ) {
+                Box(
+                    Modifier.fillMaxSize()
+                        .background(
+                            if (nameInput.trim().isNotBlank())
+                                Brush.linearGradient(listOf(accent, accentSec))
+                            else Brush.linearGradient(listOf(textSec.copy(0.3f), textSec.copy(0.3f))),
+                            RoundedCornerShape(16.dp)
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(if (isEdit) "Save Name  ✓" else "Let's Go  ➤",
+                        fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                }
+            }
+
+            if (isEdit) {
+                Spacer(Modifier.height(16.dp))
+                TextButton(onClick = { nameInput = ""; screen = Screen.SCAN }) {
+                    Text("Cancel", color = textSec)
+                }
             }
         }
     }
@@ -635,10 +760,26 @@ class MainActivity : ComponentActivity() {
                         Box(Modifier.size(36.dp)
                             .background(Brush.linearGradient(listOf(accent, accentSec)), CircleShape))
                         Spacer(Modifier.width(12.dp))
-                        Column {
+                        Column(Modifier.weight(1f)) {
                             Text("WaveChat", fontSize = 22.sp, fontWeight = FontWeight.ExtraBold,
                                 color = textPri, letterSpacing = 0.5.sp)
                             Text("Select who to chat with", fontSize = 12.sp, color = accent)
+                        }
+                        // "You are: Name" + edit button
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("You are", fontSize = 10.sp, color = textSec)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(myName, fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                                    color = accent)
+                                Spacer(Modifier.width(6.dp))
+                                Box(
+                                    Modifier.size(26.dp)
+                                        .background(accent.copy(0.12f), CircleShape)
+                                        .border(1.dp, accent.copy(0.3f), CircleShape)
+                                        .clickable { nameInput = myName; screen = Screen.SETUP },
+                                    contentAlignment = Alignment.Center
+                                ) { Text("✎", color = accent, fontSize = 13.sp) }
+                            }
                         }
                     }
                 }

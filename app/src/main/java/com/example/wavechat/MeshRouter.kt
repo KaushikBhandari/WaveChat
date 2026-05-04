@@ -114,8 +114,9 @@ class MeshRouter(
      * Marks it seen (so we don't relay our own) and sends to all peers.
      */
     fun originateMessage(text: String, connectedPeers: List<String>,
-                         recipientId: String = MeshMessage.BROADCAST_ID): MeshMessage {
-        val msg = MeshMessage(senderId = myAddress, recipientId = recipientId, text = text)
+                         recipientId: String = MeshMessage.BROADCAST_ID,
+                         senderName: String = ""): MeshMessage {
+        val msg = MeshMessage(senderId = myAddress, senderName = senderName, recipientId = recipientId, text = text)
         markSeen(msg.id)
 
         if (connectedPeers.isEmpty()) {

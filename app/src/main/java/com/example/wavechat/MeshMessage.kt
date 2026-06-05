@@ -5,11 +5,12 @@ import java.util.UUID
 /**
  * Represents a message travelling through the mesh network.
  *
- * @param id        Unique ID so every device can detect + discard duplicates.
- * @param senderId  BLE address of the original sender.
- * @param text      The actual chat text.
- * @param hopCount  How many devices this message has passed through (max = MAX_HOPS).
- * @param timestamp Unix ms — used for ordering and TTL checks.
+ * @param id          Unique ID so every device can detect + discard duplicates.
+ * @param senderId    BLE address of the original sender.
+ * @param text        The actual chat text.
+ * @param hopCount    How many devices this message has passed through (max = MAX_HOPS).
+ * @param timestamp   Unix ms — used for ordering and TTL checks.
+ * @param isEncrypted True if the text payload is encrypted using the recipient's public key.
  */
 data class MeshMessage(
     val id: String = UUID.randomUUID().toString(),
@@ -18,7 +19,8 @@ data class MeshMessage(
     val recipientId: String = BROADCAST_ID,  // target device ID; BROADCAST_ID = show to all
     val text: String,
     val hopCount: Int = 0,
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    val isEncrypted: Boolean = false
 ) {
     companion object {
         const val MAX_HOPS     = 5
@@ -35,7 +37,8 @@ data class MeshMessage(
                 recipientId = json.optString("recipient", BROADCAST_ID),
                 text        = json.getString("text"),
                 hopCount    = json.getInt("hop"),
-                timestamp   = json.getLong("ts")
+                timestamp   = json.getLong("ts"),
+                isEncrypted = json.optBoolean("enc", false)
             )
         } catch (e: Exception) { null }
     }
@@ -49,6 +52,7 @@ data class MeshMessage(
         put("text",      text)
         put("hop",       hopCount)
         put("ts",        timestamp)
+        put("enc",       isEncrypted)
     }.toString().toByteArray(Charsets.UTF_8)
 
     /**
@@ -62,8 +66,7 @@ data class MeshMessage(
 
     /** True if this message should still be forwarded. */
     fun isAlive(): Boolean =
-        hopCount < MAX_HOPS &&
-                (System.currentTimeMillis() - timestamp) < TTL_MS
+        hopCount < MAX_HOPS
 
     /** Return a copy with hop count incremented (used by relay). */
     fun relayed(): MeshMessage = copy(hopCount = hopCount + 1)

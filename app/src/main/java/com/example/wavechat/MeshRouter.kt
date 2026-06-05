@@ -115,8 +115,9 @@ class MeshRouter(
      */
     fun originateMessage(text: String, connectedPeers: List<String>,
                          recipientId: String = MeshMessage.BROADCAST_ID,
-                         senderName: String = ""): MeshMessage {
-        val msg = MeshMessage(senderId = myAddress, senderName = senderName, recipientId = recipientId, text = text)
+                         senderName: String = "",
+                         isEncrypted: Boolean = false): MeshMessage {
+        val msg = MeshMessage(senderId = myAddress, senderName = senderName, recipientId = recipientId, text = text, isEncrypted = isEncrypted)
         markSeen(msg.id)
 
         if (connectedPeers.isEmpty()) {

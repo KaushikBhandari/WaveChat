@@ -260,7 +260,8 @@ class WifiDirectManager(
             
             // Handshake: Send our name immediately
             val myName = context.getSharedPreferences("wavechat", Context.MODE_PRIVATE).getString("myName", "Device") ?: "Device"
-            sendMessage("NAME_HANDSHAKE:$myName")
+            val pubKey = CryptoUtils.getMyPublicKeyString()
+            sendMessage("NAME_HANDSHAKE:$myName|PUBKEY:$pubKey")
             
             readLoop()
         } catch (e: Exception) {

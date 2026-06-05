@@ -57,8 +57,12 @@ class MainActivity : ComponentActivity() {
     data class WifiPeer(val device: WifiP2pDevice, val customName: String)
     private val discoveredWifiDevices = mutableStateListOf<WifiPeer>()
     
-    private var activePeerAddress by mutableStateOf<String?>(null)
-    private var activePeerName by mutableStateOf<String>("")
+    private val selectedBlePeers = mutableStateListOf<String>()
+    private var activeWifiPeerAddress by mutableStateOf<String?>(null)
+    private var activeWifiPeerName by mutableStateOf<String>("")
+    
+    private val knownPeers = mutableStateMapOf<String, String>()
+    private var activeRecipientId by mutableStateOf(MeshMessage.BROADCAST_ID)
     
     // active connection states
     private var isConnected by mutableStateOf(false)
@@ -66,6 +70,7 @@ class MainActivity : ComponentActivity() {
 
     // Single chat history
     private val chatMessages = mutableStateListOf<ChatMessage>()
+    private val peerPublicKeys = mutableMapOf<String, String>()
 
     data class ChatMessage(
         val text: String,
@@ -157,6 +162,7 @@ class MainActivity : ComponentActivity() {
     // ── Lifecycle ──────────────────────────────────────────────────
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CryptoUtils.initKeys(this)
         
         wifiDirectManager = WifiDirectManager(this,
             onPeersChanged = { peers ->
@@ -193,11 +199,28 @@ class MainActivity : ComponentActivity() {
             onMessageReceived = { msg ->
                 runOnUiThread {
                     if (msg.startsWith("NAME_HANDSHAKE:")) {
-                        activePeerName = msg.substringAfter("NAME_HANDSHAKE:")
-                        setStatus("Connected with $activePeerName", true)
+                        val parts = msg.substringAfter("NAME_HANDSHAKE:").split("|PUBKEY:")
+                        activeWifiPeerName = parts[0]
+                        if (parts.size > 1) {
+                            activeWifiPeerAddress?.let { addr -> peerPublicKeys[addr] = parts[1] }
+                        }
+                        setStatus("Connected with $activeWifiPeerName", true)
                     } else {
-                        chatMessages.add(ChatMessage(msg, false, activePeerName))
-                        setStatus("Message received", true)
+                        val isEncrypted = msg.startsWith("ENC:")
+                        val decryptedText = if (isEncrypted) {
+                            try {
+                                CryptoUtils.decrypt(msg.substringAfter("ENC:"))
+                            } catch (e: Exception) {
+                                "[Encrypted message - failed to decrypt]"
+                            }
+                        } else {
+                            msg
+                        }
+                        // Only add to chat messages if it's not a PUBKEY message
+                        if (!msg.startsWith("PUBKEY:")) {
+                            chatMessages.add(ChatMessage(decryptedText, false, activeWifiPeerName))
+                            setStatus("Message received", true)
+                        }
                     }
                 }
             },
@@ -309,7 +332,7 @@ class MainActivity : ComponentActivity() {
         try { wifiDirectManager.setDeviceName(name) } catch (_: Exception) {}
         
         if (isConnected && currentScanMode == ScanMode.WIFI) {
-            wifiDirectManager.sendMessage("NAME_HANDSHAKE:$name")
+            wifiDirectManager.sendMessage("NAME_HANDSHAKE:$name|PUBKEY:${CryptoUtils.getMyPublicKeyString()}")
         }
         
         if (bleStarted) {
@@ -446,13 +469,36 @@ class MainActivity : ComponentActivity() {
                             gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
                         } catch (e: SecurityException) { }
 
-                        meshRouter.onMessageReceived(value, device.address,
-                            listOf(activePeerAddress ?: "")) { msg ->
+                        if (!connectedGatts.containsKey(device.address)) {
+                            val newDevice = BleDevice(friendlyName(device.address), device.address, 0, System.currentTimeMillis())
+                            runOnUiThread { connectToBlePeer(newDevice) }
+                        }
+
+                        val connectedAddrs = connectedGatts.keys.toList()
+                        meshRouter.onMessageReceived(value, device.address, connectedAddrs) { msg ->
                             runOnUiThread {
+                                if (msg.text.startsWith("PUBKEY:")) {
+                                    peerPublicKeys[msg.senderId] = msg.text.substringAfter("PUBKEY:")
+                                    val peerName = msg.senderName.takeIf { it.isNotBlank() } ?: friendlyName(msg.senderId)
+                                    knownPeers[msg.senderId] = peerName
+                                    return@runOnUiThread
+                                }
+
+                                val decryptedText = if (msg.isEncrypted) {
+                                    try {
+                                        CryptoUtils.decrypt(msg.text)
+                                    } catch (e: Exception) {
+                                        "[Encrypted message - failed to decrypt]"
+                                    }
+                                } else {
+                                    msg.text
+                                }
+
                                 val label = msg.senderName.takeIf { it.isNotBlank() }
                                     ?: friendlyName(device.address)
+                                knownPeers[msg.senderId] = label
                                 val chatMsg = ChatMessage(
-                                    text        = msg.text,
+                                    text        = decryptedText,
                                     isMe        = false,
                                     senderLabel = label,
                                     isRelayed   = msg.hopCount > 0,
@@ -484,10 +530,6 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("MissingPermission")
     private fun connectToBlePeer(device: BleDevice) {
         if (connectedGatts.containsKey(device.address)) return
-        activePeerAddress = device.address
-        activePeerName = device.name
-        screen = Screen.CHAT
-        chatMessages.clear()
         setStatus("Connecting to ${device.name}…", true)
         
         try {
@@ -538,6 +580,13 @@ class MainActivity : ComponentActivity() {
                         servicesReadySet.add(device.address)
                         runOnUiThread {
                             setStatus("Ready to chat!", true)
+                            val pubKeyMsg = meshRouter.originateMessage(
+                                "PUBKEY:${CryptoUtils.getMyPublicKeyString()}",
+                                connectedGatts.keys.toList(),
+                                recipientId = MeshMessage.BROADCAST_ID,
+                                senderName = myName
+                            )
+
                             sendQueue[device.address]?.forEach { msg -> sendViaBle(msg, device.address) }
                             sendQueue.remove(device.address)
                         }
@@ -548,8 +597,8 @@ class MainActivity : ComponentActivity() {
     }
     
     private fun connectToWifiPeer(device: WifiP2pDevice) {
-        activePeerAddress = device.deviceAddress
-        activePeerName = device.deviceName
+        activeWifiPeerAddress = device.deviceAddress
+        activeWifiPeerName = device.deviceName
         screen = Screen.CHAT
         chatMessages.clear()
         setStatus("Connecting to ${device.deviceName} via Wi-Fi…", true)
@@ -568,8 +617,9 @@ class MainActivity : ComponentActivity() {
             wifiDirectManager.disconnect()
         }
         isConnected = false
-        activePeerAddress = null
-        activePeerName = ""
+        activeWifiPeerAddress = null
+        activeWifiPeerName = ""
+        selectedBlePeers.clear()
     }
 
     private fun goBackToScan() {
@@ -603,16 +653,34 @@ class MainActivity : ComponentActivity() {
         val chatMsg = ChatMessage(text, true, "Me")
         
         if (currentScanMode == ScanMode.BLE) {
-            activePeerAddress?.let { addr ->
-                val msg = meshRouter.originateMessage(text, listOf(addr), senderName = myName)
-                sendViaBle(msg, addr)
-                chatMessages.add(chatMsg)
-                pendingCount = meshRouter.pendingCount()
-                messageText = ""
-                setStatus("Message sent!", true)
+            val targets = connectedGatts.keys.toList()
+            if (targets.isEmpty()) return
+            
+            val recipient = activeRecipientId
+            val pubKey = peerPublicKeys[recipient]
+            
+            val (finalText, isEnc) = if (pubKey != null && recipient != MeshMessage.BROADCAST_ID) {
+                Pair(CryptoUtils.encrypt(text, pubKey), true)
+            } else {
+                Pair(text, false)
             }
+            
+            val msg = meshRouter.originateMessage(finalText, targets, recipientId = recipient, senderName = myName, isEncrypted = isEnc)
+            chatMessages.add(chatMsg)
+            pendingCount = meshRouter.pendingCount()
+            messageText = ""
+            setStatus("Message sent!", true)
         } else {
-            wifiDirectManager.sendMessage(text)
+            activeWifiPeerAddress?.let { addr ->
+                val pubKey = peerPublicKeys[addr]
+                if (pubKey != null) {
+                    wifiDirectManager.sendMessage("ENC:${CryptoUtils.encrypt(text, pubKey)}")
+                } else {
+                    wifiDirectManager.sendMessage(text)
+                }
+            } ?: run {
+                wifiDirectManager.sendMessage(text)
+            }
             chatMessages.add(chatMsg)
             messageText = ""
             setStatus("Message sent!", true)
@@ -845,29 +913,67 @@ class MainActivity : ComponentActivity() {
                 } else {
                     if (currentScanMode == ScanMode.BLE) {
                         items(discoveredBleDevices, key = { it.address }) { device ->
-                            DeviceCard(device.name, "${device.rssi} dBm") { connectToBlePeer(device) }
+                            val isSelected = selectedBlePeers.contains(device.address)
+                            DeviceCard(device.name, "${device.rssi} dBm", isSelected = isSelected) { 
+                                if (isSelected) selectedBlePeers.remove(device.address)
+                                else selectedBlePeers.add(device.address)
+                            }
                         }
                     } else {
                         items(discoveredWifiDevices, key = { it.device.deviceAddress }) { peer ->
-                            DeviceCard(peer.customName, "Wi-Fi Direct") { connectToWifiPeer(peer.device) }
+                            DeviceCard(peer.customName, "Wi-Fi Direct", isSelected = false) { connectToWifiPeer(peer.device) }
                         }
                     }
                 }
-                item { Spacer(Modifier.height(40.dp)) }
+                item { Spacer(Modifier.height(80.dp)) }
+            }
+        }
+        
+        if (currentScanMode == ScanMode.BLE && selectedBlePeers.isNotEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+                Button(
+                    onClick = {
+                        chatMessages.clear()
+                        activeRecipientId = MeshMessage.BROADCAST_ID
+                        selectedBlePeers.forEach { addr ->
+                            discoveredBleDevices.find { it.address == addr }?.let { 
+                                knownPeers[it.address] = it.name
+                                connectToBlePeer(it) 
+                            }
+                        }
+                        screen = Screen.CHAT
+                    },
+                    modifier = Modifier.fillMaxWidth().padding(16.dp).height(54.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
+                    contentPadding = PaddingValues(0.dp)
+                ) {
+                    Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(accent, accentSec)), RoundedCornerShape(16.dp)), contentAlignment = Alignment.Center) {
+                        Text("Mesh Chat (${selectedBlePeers.size})", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                    }
+                }
             }
         }
     }
 
     @Composable
-    private fun DeviceCard(name: String, subtext: String, onTap: () -> Unit) {
-        Row(Modifier.fillMaxWidth().background(cardBg, RoundedCornerShape(16.dp)).border(1.5.dp, accent.copy(0.1f), RoundedCornerShape(16.dp)).clickable { onTap() }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(44.dp).background(accent.copy(0.1f), CircleShape), contentAlignment = Alignment.Center) { Text("📱", fontSize = 20.sp) }
+    private fun DeviceCard(name: String, subtext: String, isSelected: Boolean, onTap: () -> Unit) {
+        Row(Modifier.fillMaxWidth().background(cardBg, RoundedCornerShape(16.dp)).border(1.5.dp, if (isSelected) accent else accent.copy(0.1f), RoundedCornerShape(16.dp)).clickable { onTap() }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(44.dp).background(if (isSelected) accent else accent.copy(0.1f), CircleShape), contentAlignment = Alignment.Center) { Text("📱", fontSize = 20.sp) }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(name, fontSize = 15.sp, color = textPri, fontWeight = FontWeight.SemiBold)
                 Text(subtext, fontSize = 11.sp, color = textSec)
             }
-            Text("Tap to connect", fontSize = 11.sp, color = accentSec)
+            if (currentScanMode == ScanMode.BLE) {
+                androidx.compose.material3.Checkbox(
+                    checked = isSelected,
+                    onCheckedChange = { onTap() },
+                    colors = androidx.compose.material3.CheckboxDefaults.colors(checkedColor = accent, uncheckedColor = textSec)
+                )
+            } else {
+                Text("Tap to connect", fontSize = 11.sp, color = accentSec)
+            }
         }
     }
 
@@ -876,15 +982,42 @@ class MainActivity : ComponentActivity() {
         androidx.activity.compose.BackHandler {
             goBackToScan()
         }
-        val chatTitle = activePeerName.takeIf { it.isNotBlank() } ?: "Private Chat"
+        
+        var expanded by remember { mutableStateOf(false) }
+        val chatTitle = if (currentScanMode == ScanMode.WIFI) {
+            activeWifiPeerName.takeIf { it.isNotBlank() } ?: "Private Chat"
+        } else {
+            if (activeRecipientId == MeshMessage.BROADCAST_ID) "Mesh Chat (Everyone)"
+            else "Private: ${knownPeers[activeRecipientId] ?: "Unknown"}"
+        }
         Column(Modifier.fillMaxSize()) {
             Box(Modifier.fillMaxWidth().background(Brush.horizontalGradient(listOf(Color(0xFF0D1B3E), Color(0xFF1A0D3E)))).padding(horizontal = 16.dp, vertical = 14.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.size(36.dp).background(accent.copy(0.1f), CircleShape).border(1.dp, accent.copy(0.3f), CircleShape).clickable { goBackToScan() }, contentAlignment = Alignment.Center) { Text("←", color = accent, fontSize = 18.sp, fontWeight = FontWeight.Bold) }
                     Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(chatTitle, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = textPri)
+                    Column(Modifier.weight(1f).clickable(enabled = currentScanMode == ScanMode.BLE) { expanded = true }) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(chatTitle, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = textPri)
+                            if (currentScanMode == ScanMode.BLE) {
+                                Text(" ▼", color = textPri, fontSize = 12.sp)
+                            }
+                        }
                         Text(if (isConnected) "Connected via ${currentScanMode.name}" else "Disconnected", fontSize = 11.sp, color = if (isConnected) success else textSec)
+                        
+                        if (currentScanMode == ScanMode.BLE) {
+                            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }, modifier = Modifier.background(cardBg)) {
+                                DropdownMenuItem(
+                                    text = { Text("Mesh Chat (Everyone)", color = textPri) },
+                                    onClick = { activeRecipientId = MeshMessage.BROADCAST_ID; expanded = false }
+                                )
+                                knownPeers.forEach { (id, name) ->
+                                    DropdownMenuItem(
+                                        text = { Text("Private: $name", color = textPri) },
+                                        onClick = { activeRecipientId = id; expanded = false }
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
